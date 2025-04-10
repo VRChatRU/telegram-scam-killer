@@ -11,7 +11,7 @@ bot.on('message', async ctx => {
     if (ctx.chat && ctx.chat.type.includes('group') && ctx.message.from && ctx.message.text) {
         try {
             if(isUserChecked(ctx.message.from.id)) return
-            if(isUserScammer(ctx.message.from.id)) { if(AUTO_BAN_OR_KICK !== 'kick') await ctx.banChatMember(ctx.message.from.id) }//ну хз
+            if(isUserScammer(ctx.message.from.id)) { if(Bun.env.AUTO_BAN_OR_KICK !== 'kick') await ctx.banChatMember(ctx.message.from.id) }//ну хз
             if(!await isScam(ctx.message.text)) { recordUser(ctx.message.from.id, { scam: false }); return }
             await alertAdmin({
                 userId: ctx.message.from.id,
