@@ -1,5 +1,9 @@
 # project specific
 *.sqlite
+*.sqlite-*
+*.db
+*.db-*
+telegram-scam-killer-data/
 
 # dependencies (bun install)
 node_modules
@@ -15,15 +19,13 @@ coverage
 
 # logs
 logs
-_.log
-report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
+*.log
+*.log.*
+report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
 
 # dotenv environment variable files
 .env
-.env.development.local
-.env.test.local
-.env.production.local
-.env.local
+.env.*
 
 # caches
 .eslintcache

@@ -1,15 +1,13 @@
 {
-  "name": "telegram-scam-killer-bot",
-  "module": "app.js",
-  "type": "module",
-  "private": true,
-  "devDependencies": {
-    "@types/bun": "latest"
-  },
-  "peerDependencies": {
-    "typescript": "^5"
-  },
-  "dependencies": {
-    "telegraf": "^4.16.3"
-  }
+    "name": "telegram-scam-killer",
+    "type": "module",
+    "private": true,
+    "packageManager": "bun@1.4.4",
+    "scripts": {
+        "start": "bun telegram-scam-killer.ts",
+        "typecheck": "bun check"
+    },
+    "devDependencies": {
+        "@types/bun": "latest"
+    }
 }

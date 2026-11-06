@@ -1,16 +1,7 @@
-# telegram-scam-killer-bot
+# telegram-scam-killer
 
-### Что это?
-Бот который проверяет первые сообщения пользователей на скам(предложения заработка) в Telegram группах и записывает в базу данных. Может автоматом банить/кикать, а может просто отправлять уведомление администратору с кнопкой бана/кика. Создан специально для телеграм форума VRChatRU https://t.me/vrcru
+Telegram bot that checks group messages for scams, shares moderation alerts across admins, and syncs Delation bans.
 
-### Как установить?
-1. Создать бота в https://t.me/BotFather
-2. Выключить приватность в настройках бота, дать возможность банить и удалять сообщения
-3. Пригласить бота в группу и выдать возможность банить и удалять сообщения
-4. Установить на сервер https://bun.sh/
-5. Перейти в папку и ввести `bun i` для установки зависимостей
-6. Создать файл `.env` по примеру `example.env`
-7. Запустить `bun run app.js`
-
-### TODO
-- Разрешить приглашать в группы только администратору
+1. Copy `example.env` to `.env` and set `BOT_TOKEN`, `ADMIN_IDS`, `OPENROUTER_KEY`, and `UPTIME_KUMA_URL`. Every listed admin must open the same bot and send `/start`.
+2. Enable **Bot-to-Bot Communication Mode** and disable **Group Privacy** in [@BotFather](https://t.me/BotFather). Re-add the bot if you changed Group Privacy. Make it a group admin with permission to delete messages and ban users. Use a supergroup for kick mode.
+3. Run one instance with `bun run start` on [Bun 1.4.4 or newer](https://bun.sh/).
