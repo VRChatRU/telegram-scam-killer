@@ -15,7 +15,7 @@ type CaseRow = Report & { id: number; status: Status; revision: number }
 export type Case = CaseRow & { outcome: Outcome | null }
 
 type Check = Report & { messageId: number }
-type QueuedCheck = Check & { attempts: number }
+type QueuedCheck = Check & { attempts: number; forceScam: boolean }
 type Alert = { report: Case; adminId: number; messageId: number | null; attempts: number }
 type AlertRow = Case & { adminId: number; alertMessageId: number | null; attempts: number }
 
@@ -67,6 +67,11 @@ export class Storage {
                     case_id INTEGER PRIMARY KEY REFERENCES cases (id),
                     outcome TEXT CHECK (outcome IN ('delation', 'automatic', 'unban', 'pardon'))
                 );
+                CREATE TABLE IF NOT EXISTS case_alert_policies (
+                    case_id INTEGER PRIMARY KEY REFERENCES cases (id),
+                    release_at INTEGER,
+                    suppressed INTEGER NOT NULL DEFAULT 0 CHECK (suppressed IN (0, 1))
+                );
 
                 CREATE TABLE IF NOT EXISTS checks (
                     chat_id INTEGER NOT NULL,
@@ -75,6 +80,7 @@ export class Storage {
                     chat_title TEXT NOT NULL,
                     name TEXT NOT NULL,
                     text TEXT NOT NULL,
+                    force_scam INTEGER NOT NULL DEFAULT 0 CHECK (force_scam IN (0, 1)),
                     next_at INTEGER NOT NULL DEFAULT 0,
                     attempts INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (chat_id, user_id)
@@ -92,9 +98,16 @@ export class Storage {
                 );
             `)
             this.db.transaction(() => {
+                if (!this.db.query("SELECT 1 FROM pragma_table_info('checks') WHERE name = 'force_scam'").get()) {
+                    this.db.exec('ALTER TABLE checks ADD COLUMN force_scam INTEGER NOT NULL DEFAULT 0 CHECK (force_scam IN (0, 1))')
+                }
                 // Refresh open cards that were sent before they had a pardon button.
                 this.db.query("UPDATE cases SET revision = ? WHERE status = 'pending' AND revision < ?")
                     .run(initialCaseRevision, initialCaseRevision)
+                this.db.query(`
+                    INSERT OR IGNORE INTO case_alert_policies (case_id, suppressed)
+                    SELECT id, 1 FROM (SELECT ${caseWithOutcome} FROM ${caseSource}) WHERE outcome = 'delation'
+                `).run()
                 const addPendingAlerts = this.db.query(`
                     INSERT OR IGNORE INTO alerts (case_id, admin_id) SELECT id, ? FROM cases WHERE status = 'pending'
                 `)
@@ -120,7 +133,7 @@ export class Storage {
         return this.db.query<Case, [number]>(`SELECT ${caseWithOutcome} FROM ${caseSource} WHERE id = ?`).get(id)
     }
 
-    openCase(report: Report, initialStatus: Status = 'pending', outcome: Outcome | null = null): Case {
+    openCase(report: Report, initialStatus: Status = 'pending', outcome: Outcome | null = null, holdAlerts = false): Case {
         return this.db.transaction(() => {
             const existing = this.getCase(report.chatId, report.userId)
             if (existing) return existing
@@ -133,6 +146,7 @@ export class Storage {
 
             const createAlert = this.db.query('INSERT INTO alerts (case_id, admin_id) VALUES (?, ?)')
             for (const adminId of this.adminIds) createAlert.run(opened.id, adminId)
+            if (holdAlerts) this.db.query('INSERT INTO case_alert_policies (case_id) VALUES (?)').run(opened.id)
             this.writeOutcome(opened.id, outcome)
             this.recordStatus(opened.userId, opened.status)
             return { ...opened, outcome }
@@ -155,7 +169,7 @@ export class Storage {
         }).immediate()
     }
 
-    recordDelationBan(report: Report, eventId: number, eventDate: number): Case | null {
+    recordDelationAction(report: Report, eventId: number, eventDate: number, status: 'banned' | 'kicked'): Case | null {
         return this.db.transaction(() => {
             const inserted = this.db.query(`
                 INSERT INTO delation_bans (update_id, event_date) VALUES (?, ?)
@@ -164,8 +178,20 @@ export class Storage {
             if (!inserted.changes) return null
 
             const existing = this.getCase(report.chatId, report.userId)
-            return existing ? this.setStatus(existing.id, 'banned', 'delation') : this.openCase(report, 'banned', 'delation')
+            const updated = existing ? this.setStatus(existing.id, status, 'delation') : this.openCase(report, status, 'delation')
+            this.db.query(`
+                INSERT INTO case_alert_policies (case_id, suppressed) VALUES (?, 1)
+                ON CONFLICT (case_id) DO UPDATE SET suppressed = 1
+            `).run(updated.id)
+            return updated
         }).immediate()
+    }
+
+    releaseAlerts(caseId: number, nextAt: number) {
+        this.db.query(`
+            UPDATE case_alert_policies SET release_at = ?
+            WHERE case_id = ? AND release_at IS NULL AND suppressed = 0
+        `).run(nextAt, caseId)
     }
 
     isChecked(id: number): boolean {
@@ -183,19 +209,21 @@ export class Storage {
         `).run(id, id)
     }
 
-    enqueueCheck(report: Check): boolean {
+    enqueueCheck(report: Check & { forceScam?: boolean }): boolean {
+        const forceScam = Number(report.forceScam === true)
         return this.db.query(`
-            INSERT INTO checks (chat_id, user_id, message_id, chat_title, name, text)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO checks (chat_id, user_id, message_id, chat_title, name, text, force_scam)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (chat_id, user_id) DO NOTHING
-        `).run(report.chatId, report.userId, report.messageId, report.chatTitle, report.name, report.text).changes > 0
+        `).run(report.chatId, report.userId, report.messageId, report.chatTitle, report.name, report.text, forceScam).changes > 0
     }
 
-    nextCheck(now: number): QueuedCheck | null {
-        return this.db.query<QueuedCheck, [number]>(`
-            SELECT ${reportColumns}, attempts FROM checks
-            WHERE next_at <= ? ORDER BY next_at, rowid LIMIT 1
-        `).get(now)
+    nextCheck(now: number, forceScam: boolean): QueuedCheck | null {
+        const check = this.db.query<Check & { attempts: number; forceScam: number }, [number, number]>(`
+            SELECT ${reportColumns}, attempts, force_scam AS forceScam FROM checks
+            WHERE next_at <= ? AND force_scam = ? ORDER BY next_at, rowid LIMIT 1
+        `).get(now, Number(forceScam))
+        return check && { ...check, forceScam: Boolean(check.forceScam) }
     }
 
     finishCheck(report: Check) {
@@ -217,9 +245,12 @@ export class Storage {
         const alert = this.db.query<AlertRow, number[]>(`
             SELECT ${caseWithOutcome}, admin_id AS adminId, alert_message_id AS alertMessageId, attempts
             FROM ${caseSource} JOIN alerts ON alerts.case_id = cases.id
+            LEFT JOIN case_alert_policies ON case_alert_policies.case_id = cases.id
             WHERE applied_revision < revision AND next_at <= ? AND admin_id IN (${adminPlaceholders})
+                AND (alert_message_id IS NOT NULL OR case_alert_policies.case_id IS NULL
+                    OR (case_alert_policies.suppressed = 0 AND case_alert_policies.release_at <= ?))
             ORDER BY alert_message_id IS NULL, next_at, alerts.case_id, admin_id LIMIT 1
-        `).get(now, ...this.adminIds)
+        `).get(now, ...this.adminIds, now)
         if (!alert) return null
 
         const { adminId, alertMessageId, attempts, ...report } = alert

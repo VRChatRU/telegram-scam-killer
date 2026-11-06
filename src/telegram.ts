@@ -13,6 +13,11 @@ export type Chat = {
     username?: string
 }
 
+type MessageOrigin =
+    | { type: 'user' | 'hidden_user' }
+    | { type: 'chat'; sender_chat: Chat }
+    | { type: 'channel'; chat: Chat }
+
 export type Message = {
     message_id: number
     date: number
@@ -21,6 +26,8 @@ export type Message = {
     sender_chat?: Chat
     text?: string
     caption?: string
+    forward_origin?: MessageOrigin
+    external_reply?: { chat?: Chat }
     reply_markup?: Keyboard
 }
 
@@ -31,9 +38,10 @@ export type CallbackQuery = {
     message?: Message
 }
 
-type ChatMember = {
+export type ChatMember = {
     user: User
     status: 'creator' | 'administrator' | 'member' | 'restricted' | 'left' | 'kicked'
+    is_member?: boolean
 }
 
 export type ChatMemberUpdated = {
@@ -108,12 +116,12 @@ export class Telegram {
         throw new Error(`Telegram ${method} returned an invalid response (HTTP ${response.status})`)
     }
 
-    async getUpdates(offset: number | undefined): Promise<Update[]> {
+    async getUpdates(offset: number | undefined, timeout = 25): Promise<Update[]> {
         const updates = await this.call<Update[]>('getUpdates', {
             offset,
-            timeout: 25,
+            timeout,
             allowed_updates: ['message', 'edited_message', 'callback_query', 'chat_member'],
-        }, 35_000)
+        }, (timeout + 10) * 1000)
         if (!Array.isArray(updates) || updates.some(update => !Number.isSafeInteger(update?.update_id))) {
             throw new Error('Telegram getUpdates returned an invalid update list')
         }

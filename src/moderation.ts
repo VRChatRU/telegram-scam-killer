@@ -3,13 +3,14 @@ import { errorMessage, log, retryDelay, sleep } from './runtime'
 import type { Config } from './runtime'
 import type { Case, Outcome, Report, Status, Storage } from './storage'
 import { ApiError } from './telegram'
-import type { CallbackQuery, Chat, ChatMemberUpdated, Keyboard, Message, Telegram, Update, User } from './telegram'
+import type { CallbackQuery, Chat, ChatMember, ChatMemberUpdated, Keyboard, Message, Telegram, Update, User } from './telegram'
 
 const actionResults = {
     ban: 'Забанен ✅', kick: 'Кикнут ✅', unban: 'Разбанен ✅', pardon: 'Не скаммер ✅', scam: 'Помечен как скаммер ✅',
 }
 type Action = keyof typeof actionResults
-type Check = Report & { messageId: number; attempts: number }
+type Check = Report & { messageId: number; forceScam: boolean }
+const alertDelay = 10_000
 
 function buttons({ status, outcome }: Case, mode: Config['mode']): [Action, string][] {
     switch (status) {
@@ -27,7 +28,10 @@ function buttons({ status, outcome }: Case, mode: Config['mode']): [Action, stri
             if (outcome === 'pardon') return [['scam', 'Не скаммер ✅ Пометить как скамера? 💀']]
             return [['ban', 'Забанить 💀'], ['scam', 'Пометить как скамера? 💀']]
         }
-        case 'kicked': return [['pardon', outcome === 'automatic' ? 'Не скаммер 😅' : 'Кикнут ✅ Не скаммер? 😅']]
+        case 'kicked': {
+            if (outcome === 'delation') return [['pardon', 'Кикнул Delation ✅ Не скаммер? 😅']]
+            return [['pardon', outcome === 'automatic' ? 'Не скаммер 😅' : 'Кикнут ✅ Не скаммер? 😅']]
+        }
         case 'scam': return [['pardon', 'Помечен как скаммер ✅ Отменить? 😅']]
     }
 }
@@ -48,13 +52,29 @@ function alertText(report: Case) {
 
     const title = escapeHtml([name, userId].filter(Boolean).join(' '))
     const header = `⚠️ Скаммер <b>${title}</b> в чате <b>${escapeHtml(chatTitle)}</b>`
-    const delation = report.outcome === 'delation' ? '\n🚫 Забанил Delation' : ''
+    let delation = ''
+    if (report.outcome === 'delation') {
+        delation = report.status === 'kicked' ? '\n👢 Кикнул Delation' : '\n🚫 Забанил Delation'
+    }
     const excerpt = report.messageId !== null && text ? `\n<pre>${escapeHtml([...text].slice(0, 3400).join(''))}</pre>` : ''
     return header + delation + excerpt
 }
 
 function isGroup(chat: Chat) {
     return chat.type === 'group' || chat.type === 'supergroup'
+}
+
+function hasExternalSource({ chat, external_reply, forward_origin }: Message) {
+    if (external_reply && external_reply.chat?.id !== chat.id) return true
+    if (!forward_origin) return false
+    if (forward_origin.type === 'channel') return forward_origin.chat.id !== chat.id
+    if (forward_origin.type === 'chat') return forward_origin.sender_chat.id !== chat.id
+    return true
+}
+
+function isChatMember(member: ChatMember) {
+    return member.status === 'member' || member.status === 'administrator' || member.status === 'creator'
+        || (member.status === 'restricted' && member.is_member === true)
 }
 
 function reportFor(chat: Chat, user: User, messageId: number | null, text: string): Report {
@@ -78,6 +98,7 @@ function matchesApiError(error: unknown, description: RegExp) {
 
 export class Moderation {
     private operations = Promise.resolve()
+    updatesCaughtUp = false
 
     constructor(
         private readonly config: Config,
@@ -109,12 +130,15 @@ export class Moderation {
 
     private async onMember({ chat, from, date, old_chat_member: old, new_chat_member: current }: ChatMemberUpdated, updateId: number) {
         if (!isGroup(chat) || !this.isDelation(from) || current.user.is_bot) return
-        if (old.status === 'kicked' || current.status !== 'kicked') return
+        let status: 'banned' | 'kicked'
+        if (current.status === 'kicked' && old.status !== 'kicked') status = 'banned'
+        else if (current.status === 'left' && isChatMember(old)) status = 'kicked'
+        else return
 
-        const report = this.storage.recordDelationBan(
-            reportFor(chat, current.user, null, ''), updateId, date,
+        const report = this.storage.recordDelationAction(
+            reportFor(chat, current.user, null, ''), updateId, date, status,
         )
-        if (report) log('info', 'delation_ban_recorded', { caseId: report.id, chatId: chat.id, userId: current.user.id })
+        if (report) log('info', 'delation_action_recorded', { caseId: report.id, chatId: chat.id, userId: current.user.id, status })
     }
 
     private async onMessage(message: Message, edited: boolean) {
@@ -141,9 +165,12 @@ export class Moderation {
             await this.deleteMessage(chat.id, messageId, 'delation_plus')
             return
         }
-        if (edited || from.is_bot || !text.trim() || this.storage.isChecked(from.id)) return
-        if (this.storage.getCase(chat.id, from.id)?.status === 'cleared') return
-        if (this.storage.enqueueCheck({ ...reportFor(chat, from, messageId, text), messageId })) {
+        if (edited || from.is_bot || this.storage.isChecked(from.id)) return
+        const existing = this.storage.getCase(chat.id, from.id)
+        if (existing?.status === 'cleared') return
+        const forceScam = !existing && hasExternalSource(message)
+        if (!forceScam && !text.trim()) return
+        if (this.storage.enqueueCheck({ ...reportFor(chat, from, messageId, text), messageId, forceScam })) {
             log('info', 'check_queued', { chatId: chat.id, messageId, userId: from.id })
         }
     }
@@ -160,10 +187,10 @@ export class Moderation {
         }
     }
 
-    async checkLoop() {
+    async checkLoop(forceScam: boolean) {
         let classifierFailures = 0
         while (!this.signal.aborted) {
-            const check = this.storage.nextCheck(Date.now())
+            const check = this.storage.nextCheck(Date.now(), forceScam)
             if (!check) {
                 await sleep(500, this.signal)
                 continue
@@ -189,32 +216,44 @@ export class Moderation {
         const existing = this.storage.getCase(check.chatId, check.userId)
         const newText = !existing || (existing.status === 'pending' && existing.messageId !== check.messageId)
         const needsVerdict = newText && !this.storage.isScammer(check.userId) && !this.storage.isChecked(check.userId)
-        const verdict = needsVerdict ? await classify(check.text, this.config, this.signal) : undefined
-        if (verdict) log('info', 'check_completed', { chatId: check.chatId, userId: check.userId, verdict })
+        const external = needsVerdict && !existing && check.forceScam
+        let verdict: 'SCAM' | 'GOOD' | undefined
+        if (external) verdict = 'SCAM'
+        else if (needsVerdict && check.text.trim()) verdict = await classify(check.text, this.config, this.signal)
+        if (verdict) log('info', 'check_completed', { chatId: check.chatId, userId: check.userId, verdict, source: external ? 'external_message' : 'ai' })
 
-        await this.serialize(async () => {
+        const report = await this.serialize(async () => {
             const current = this.storage.getCase(check.chatId, check.userId)
             const known = this.storage.isScammer(check.userId)
             if (current?.status === 'cleared') return
+            if (!current && this.storage.isChecked(check.userId)) return
             if (!current && !known && verdict !== 'SCAM') {
                 if (verdict === 'GOOD') this.storage.markChecked(check.userId)
                 return
             }
             if (current?.status === 'pending' && current.messageId !== check.messageId && !known && verdict !== 'SCAM') return
 
-            const report = current ?? this.storage.openCase(check)
+            const text = external ? `Сработал фильтр пересылок и внешних ответов.\n${check.text}`.trimEnd() : check.text
+            const opened = current ?? this.storage.openCase({ ...check, text }, 'pending', null, true)
             await this.deleteMessage(check.chatId, check.messageId, 'scam')
-            if (!known && !this.config.auto) return
-            if (report.status === 'banned' && report.messageId === check.messageId) return
+            this.storage.releaseAlerts(opened.id, Date.now() + alertDelay)
+            return opened
+        })
+        if (!report || (!this.config.auto && !this.storage.isScammer(check.userId))) return
+
+        await this.serialize(async () => {
+            const current = this.storage.getCaseById(report.id)
+            if (!current || current.status === 'cleared') return
+            if (current.status === 'banned' && current.messageId === check.messageId) return
 
             try {
-                if (report.status === 'banned') {
-                    const member = await this.telegram.call<{ status: string }>('getChatMember', {
-                        chat_id: report.chatId, user_id: report.userId,
+                if (current.status === 'banned' || current.outcome === 'delation') {
+                    const member = await this.telegram.call<ChatMember>('getChatMember', {
+                        chat_id: current.chatId, user_id: current.userId,
                     })
-                    if (member.status === 'kicked') return
+                    if (member.status === 'kicked' || (current.outcome === 'delation' && !isChatMember(member))) return
                 }
-                await this.applyAction(report, this.config.mode, 'automatic')
+                await this.applyAction(current, this.config.mode, 'automatic')
             } catch (error) {
                 if (isRetryable(error)) throw error
                 log('warn', 'automatic_action_failed', { caseId: report.id, error: errorMessage(error) })
@@ -224,7 +263,7 @@ export class Moderation {
 
     async alertLoop() {
         while (!this.signal.aborted) {
-            const alert = this.storage.nextAlert(Date.now())
+            const alert = this.updatesCaughtUp ? this.storage.nextAlert(Date.now()) : null
             if (!alert) {
                 await sleep(500, this.signal)
                 continue

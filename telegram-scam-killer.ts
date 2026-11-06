@@ -8,7 +8,8 @@ async function poll(telegram: Telegram, moderation: Moderation, signal: AbortSig
     let failures = 0
     while (!signal.aborted) {
         try {
-            const updates = await telegram.getUpdates(offset)
+            const updates = await telegram.getUpdates(offset, moderation.updatesCaughtUp ? 25 : 0)
+            moderation.updatesCaughtUp = updates.length === 0
             for (const update of updates) {
                 if (signal.aborted) return
                 await moderation.update(update)
@@ -20,6 +21,7 @@ async function poll(telegram: Telegram, moderation: Moderation, signal: AbortSig
         } catch (error) {
             if (signal.aborted) return
             if (error instanceof ApiError && (error.code === 401 || error.code === 404)) throw error
+            moderation.updatesCaughtUp = false
             const delay = retryDelay(failures++, error instanceof ApiError ? error.retryAfter : 0)
             log('warn', 'telegram_poll_retry', { delay, error: errorMessage(error) })
             await sleep(delay, signal)
@@ -41,7 +43,12 @@ async function main() {
     const stopHeartbeat = startHeartbeat(config.kumaUrl, signal)
     log('info', 'service_started', { admins: config.adminIds.length, mode: config.mode, automatic: config.auto, model: config.model })
 
-    const workers = [poll(telegram, moderation, signal), moderation.checkLoop(), moderation.alertLoop()]
+    const workers = [
+        poll(telegram, moderation, signal),
+        moderation.checkLoop(true),
+        moderation.checkLoop(false),
+        moderation.alertLoop(),
+    ]
     try {
         await Promise.all(workers)
     } finally {
