@@ -247,7 +247,6 @@ export class Moderation {
                     ? await this.telegram.call<Message>('sendMessage', body)
                     : await this.telegram.call<Message>('editMessageText', { ...body, message_id: messageId })
                 this.storage.markAlert(report.id, adminId, sent.message_id, report.revision)
-                log('info', 'alert_synced', { caseId: report.id, adminId, messageId: sent.message_id, revision: report.revision })
             } catch (error) {
                 if (this.signal.aborted) return
                 if (this.storage.getCaseById(report.id)?.revision !== report.revision) continue
