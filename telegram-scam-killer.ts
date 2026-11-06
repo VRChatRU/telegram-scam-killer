@@ -1,7 +1,7 @@
-import { Moderation } from './moderation'
-import { errorMessage, loadConfig, log, retryDelay, sleep, startHeartbeat } from './runtime'
-import { Storage } from './storage'
-import { ApiError, Telegram } from './telegram'
+import { Moderation } from './src/moderation'
+import { errorMessage, loadConfig, log, retryDelay, sleep, startHeartbeat } from './src/runtime'
+import { Storage } from './src/storage'
+import { ApiError, Telegram } from './src/telegram'
 
 async function poll(telegram: Telegram, moderation: Moderation, signal: AbortSignal) {
     let offset: number | undefined
